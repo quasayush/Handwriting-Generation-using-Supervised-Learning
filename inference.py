@@ -10,12 +10,29 @@ from pathlib import Path
 
 def main():
     handtext= Path('input.txt').read_text()
+    styleinput= Path('style.txt').read_text()
+    if styleinput in ['a', 'A']:
+      stylepath= './assets/a02-050-03.tif'
+    if styleinput in ['b', 'B']:
+      stylepath= './assets/g06-150z-03.tif'
+    if styleinput in ['c', 'C']:
+      stylepath= './assets/j07-370z-01.tif'
+    if styleinput in ['d', 'D']:
+      stylepath= './assets/k04-274z-01.tif'
+    if styleinput in ['e', 'E']:
+      stylepath= './assets/n04-225z-01.tif'
+    if styleinput in ['f', 'F']:
+      stylepath= './assets/r06-412z-04.tif'
+    if styleinput in ['g', 'G']:
+      stylepath= './assets/custom.tif'
+    else:
+      stylepath= None
     parser = argparse.ArgumentParser()  
     parser.add_argument('--textstring', help='the text you want to generate', default=handtext, type=str)  
     parser.add_argument('--writersource', help="path of the image of the desired writer, (e.g. './assets/j07-370z-01.tif'   \
-                                                will use random from ./assets if unspecified", default='./assets/aaa.tif')
+                                                will use random from ./assets if unspecified", default=stylepath)
     parser.add_argument('--name', help="path for generated image (e.g. './assets/sample.png'), \
-                                             will not be saved if unspecified", default='./assets/aaa')
+                                             will not be saved if unspecified", default='./assets/output')
     parser.add_argument('--diffmode', help="what kind of y_t-1 prediction to use, use 'standard' for  \
                                             Eq 9 in paper, will default to prediction in Eq 12", default='new', type=str)
     parser.add_argument('--show', help="whether to show the sample (popup from matplotlib)", default=False, type=bool)
