@@ -6,14 +6,16 @@ import nn
 import argparse
 import os
 import preprocessing
+from pathlib import Path
 
 def main():
+    handtext= Path('input.txt').read_text()
     parser = argparse.ArgumentParser()  
-    parser.add_argument('--textstring', help='the text you want to generate', default='Generating text', type=str)  
-    parser.add_argument('--writersource', help="path of the image of the desired writer, (e.g. './assets/image.png'   \
-                                                will use random from ./assets if unspecified", default=None)
+    parser.add_argument('--textstring', help='the text you want to generate', default=handtext, type=str)  
+    parser.add_argument('--writersource', help="path of the image of the desired writer, (e.g. './assets/j07-370z-01.tif'   \
+                                                will use random from ./assets if unspecified", default='./assets/aaa.tif')
     parser.add_argument('--name', help="path for generated image (e.g. './assets/sample.png'), \
-                                             will not be saved if unspecified", default=None)
+                                             will not be saved if unspecified", default='./assets/aaa')
     parser.add_argument('--diffmode', help="what kind of y_t-1 prediction to use, use 'standard' for  \
                                             Eq 9 in paper, will default to prediction in Eq 12", default='new', type=str)
     parser.add_argument('--show', help="whether to show the sample (popup from matplotlib)", default=False, type=bool)
