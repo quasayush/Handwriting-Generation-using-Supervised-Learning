@@ -1,310 +1,95 @@
-import argparse
-import os
-import time
+import tensorflow as tf
 import numpy as np
-import matplotlib.pyplot as plt 
-plt.switch_backend('agg')
+import matplotlib.pyplot as plt
+import utils
+import nn
+import time
+import argparse
 
-# import pytorch modules
-import torch
-from torch.autograd import Variable
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.utils.data
+@tf.function
+def train_step(x, pen_lifts, text, style_vectors, glob_args):
+    model, alpha_set, bce, train_loss, optimizer = glob_args
+    alphas = utils.get_alphas(len(x), alpha_set)
+    eps = tf.random.normal(tf.shape(x))
+    x_perturbed = tf.sqrt(alphas) * x 
+    x_perturbed += tf.sqrt(1 - alphas) * eps
+    
+    with tf.GradientTape() as tape:
+        score, pl_pred, att = model(x_perturbed, text, tf.sqrt(alphas), style_vectors, training=True)
+        loss = nn.loss_fn(eps, score, pen_lifts, pl_pred, alphas, bce)
+        
+    gradients = tape.gradient(loss, model.trainable_variables)  
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    train_loss(loss)
+    return score, att
 
-# import model and utilities
-from model import LSTMRandWriter, LSTMSynthesis
-from utilz import decay_learning_rate, save_checkpoint
+def train(dataset, iterations, model, optimizer, alpha_set, print_every=1000, save_every=10000):
+    s = time.time()
+    bce = tf.keras.losses.BinaryCrossentropy(from_logits=False)
+    train_loss = tf.keras.metrics.Mean()
+    for count, (strokes, text, style_vectors) in enumerate(dataset.repeat(5000)):
+        strokes, pen_lifts = strokes[:, :, :2], strokes[:, :, 2:]
+        glob_args = model, alpha_set, bce, train_loss, optimizer
+        model_out, att = train_step(strokes, pen_lifts, text, style_vectors, glob_args)
+        
+        if optimizer.iterations%print_every==0:
+            print("Iteration %d, Loss %f, Time %ds" % (optimizer.iterations, train_loss.result(), time.time()-s))
+            train_loss.reset_states()
 
-# find gpu
-cuda = torch.cuda.is_available()
+        if (optimizer.iterations+1) % save_every==0:
+            save_path = ckpt_path + './weights/model_step%d.h5' % (optimizer.iterations+1)
+            model.save_weights(save_path)
+            
+        if optimizer.iterations > iterations:
+            model.save_weights('./weights/model.h5')
+            break
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='rand_write',
-                        help='"rand_write" or "synthesis"')
-    parser.add_argument('--cell_size', type=int, default=400,
-                        help='size of LSTM hidden state')
-    parser.add_argument('--batch_size', type=int, default=50,
-                        help='minibatch size')
-    parser.add_argument('--timesteps', type=int, default=800,
-                        help='LSTM sequence length')
-    parser.add_argument('--num_epochs', type=int, default=50,
-                        help='number of epochs')
-    parser.add_argument('--model_dir', type=str, default='save',
-                        help='directory to save model to')
-    parser.add_argument('--learning_rate', type=float, default=8E-4,
-                        help='learning rate')
-    parser.add_argument('--decay_rate', type=float, default=0.99,
-                        help='lr decay rate for adam optimizer per epoch')
-    parser.add_argument('--num_clusters', type=int, default=20,
-                        help='number of gaussian mixture clusters for stroke prediction')
-    parser.add_argument('--K', type=int, default=10,
-                        help='number of attention clusters on text input')
+    parser = argparse.ArgumentParser()    
+    parser.add_argument('--steps', help='number of trainsteps, default 60k', default=60000, type=int)
+    parser.add_argument('--batchsize', help='default 96', default=96, type=int)
+    parser.add_argument('--seqlen', help='sequence length during training, default 480', default=480, type=int)
+    parser.add_argument('--textlen', help='text length during training, default 50', default=50, type=int)
+    parser.add_argument('--width', help='offline image width, default 1400', default=1400, type=int)
+    parser.add_argument('--warmup', help='number of warmup steps, default 10k', default=10000, type=int)
+    parser.add_argument('--dropout', help='dropout rate, default 0', default=0.0, type=float)
+    parser.add_argument('--num_attlayers', help='number of attentional layers at lowest resolution', default=2, type=int)
+    parser.add_argument('--channels', help='number of channels in first layer, default 128', default=128, type=int)
+    parser.add_argument('--print_every', help='show train loss every n iters', default=1000, type=int)
+    parser.add_argument('--save_every', help='save ckpt every n iters', default=10000, type=int)
+
     args = parser.parse_args()
-    
-    # prepare training data
-    train_data = [np.load('data/train_strokes_800.npy'), np.load('data/train_masks_800.npy'), np.load('data/train_onehot_800.npy'),
-                np.load('data/train_text_lens.npy')]
-    for _ in range(len(train_data)):
-        train_data[_] =torch.from_numpy(train_data[_]).type(torch.FloatTensor)
-        if cuda:
-            train_data[_] = train_data[_].cuda()
-    train_data = [(train_data[0][i], train_data[1][i], 
-                train_data[2][i], train_data[3][i]) for i in range(len(train_data[0]))] 
-    train_loader = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size, shuffle=True, drop_last=True)
-        
-    # prepare validation data
-    validation_data = [np.load('data/validation_strokes_800.npy'), np.load('data/validation_masks_800.npy'), 
-                    np.load('data/validation_onehot_800.npy'), np.load('data/validation_text_lens.npy')]
-    for _ in range(len(validation_data)):
-        validation_data[_] = torch.from_numpy(validation_data[_]).type(torch.FloatTensor)
-        if cuda:
-            validation_data[_] = validation_data[_].cuda()
-    validation_data = [(validation_data[0][i], validation_data[1][i], validation_data[2][i], validation_data[3][i]) 
-                    for i in range(len(validation_data[0]))] 
-    validation_loader = torch.utils.data.DataLoader(
-        validation_data, batch_size=args.batch_size, shuffle=False, drop_last=True)
-    
-    
-    # training
-    if args.task == 'rand_write':
-        rand_write_train(args, train_loader, validation_loader)
-        
-    if args.task == 'synthesis':
-        synthesis_train(args, train_loader, validation_loader)
-        
+    NUM_STEPS = args.steps
+    BATCH_SIZE = args.batchsize
+    MAX_SEQ_LEN = args.seqlen
+    MAX_TEXT_LEN = args.textlen
+    WIDTH = args.width
+    DROP_RATE = args.dropout
+    NUM_ATTLAYERS = args.num_attlayers
+    WARMUP_STEPS = args.warmup
+    PRINT_EVERY = args.print_every
+    SAVE_EVERY = args.save_every
+    C1 = args.channels
+    C2 = C1 * 3//2
+    C3 = C1 * 2
+    MAX_SEQ_LEN = MAX_SEQ_LEN - (MAX_SEQ_LEN%8) + 8
 
-def rand_write_train(args, train_loader, validation_loader):
-    # define model and optimizer
-    model = LSTMRandWriter(args.cell_size, args.num_clusters)
-    if cuda:
-        model = model.cuda()
-    
-    optimizer = optim.Adam([{'params':model.parameters()},], lr=args.learning_rate)
-    
-    # initialize null hidden states and memory states
-    init_states = [torch.zeros((1,args.batch_size,args.cell_size))]*4
-    if cuda:
-        init_states  = [state.cuda() for state in init_states]
-    init_states  = [Variable(state, requires_grad = False) for state in init_states]
-    h1_init, c1_init, h2_init, c2_init = init_states
+    BUFFER_SIZE = 3000
+    L = 60
+    tokenizer = utils.Tokenizer()
+    beta_set = utils.get_beta_set()
+    alpha_set = tf.math.cumprod(1-beta_set)
 
-    t_loss = []
-    v_loss = []
-    best_validation_loss = 1E10
+    style_extractor = nn.StyleExtractor()
+    model = nn.DiffusionWriter(num_layers=NUM_ATTLAYERS, c1=C1, c2=C2, c3=C3, drop_rate=DROP_RATE)
+    lr = nn.InvSqrtSchedule(C3, warmup_steps=WARMUP_STEPS)
+    optimizer = tf.keras.optimizers.Adam(lr, beta_1=0.9, beta_2=0.98, clipnorm=100)
+    
+    path = './data/train_strokes.p'
+    strokes, texts, samples = utils.preprocess_data(path, MAX_TEXT_LEN, MAX_SEQ_LEN, WIDTH, 96)
+    dataset = utils.create_dataset(strokes, texts, samples, style_extractor, BATCH_SIZE, BUFFER_SIZE)
 
-    # update training time
-    start_time = time.time()
-    
-    for epoch in range(args.num_epochs):
-        train_loss = 0
-        for batch_idx, (data, masks, onehots, text_lens) in enumerate(train_loader):
-            
-            # gather training batch
-            step_back = data.narrow(1,0,args.timesteps)
-            x = Variable(step_back, requires_grad=False)
-            masks = Variable(masks, requires_grad=False)
-            masks = masks.narrow(1,0,args.timesteps)
-            
-            optimizer.zero_grad()
-            # feed forward
-            outputs = model(x, (h1_init, c1_init), (h2_init, c2_init))
-            end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho , prev, prev2 = outputs
-            
-            # supervision
-            data = data.narrow(1,1,args.timesteps)
-            y = Variable(data, requires_grad=False)
-            loss = -log_likelihood(end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, y, masks)/torch.sum(masks)
-            loss.backward()
-            train_loss += loss.data
-            optimizer.step()
-            
-            if batch_idx % 10 == 0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(\
-                    epoch+1, batch_idx * len(data), len(train_loader.dataset),
-                    100. * batch_idx / len(train_loader),
-                    loss.data))
-        
-        # update training performance
-        print('====> Epoch: {} Average train loss: {:.4f}'.format(\
-            epoch+1, train_loss/(len(train_loader.dataset)//args.batch_size)))
-        t_loss.append(train_loss/(len(train_loader.dataset)//args.batch_size))
-        
-        # validation
-        # prepare validation sample data
-        (validation_samples, masks, onehots, text_lens) = list(enumerate(validation_loader))[0][1]
-        step_back2 = validation_samples.narrow(1,0,args.timesteps)
-        masks = Variable(masks, requires_grad=False)
-        masks = masks.narrow(1,0,args.timesteps)
-        
-        x = Variable(step_back2, requires_grad=False)
-        
-        validation_samples = validation_samples.narrow(1,1,args.timesteps)
-        y = Variable(validation_samples, requires_grad = False)
-        
-        outputs = model(y, (h1_init, c1_init), (h2_init, c2_init))
-        end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho , prev, prev2 = outputs 
-        loss = -log_likelihood(end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, y, masks)/torch.sum(masks)
-        validation_loss = loss.data
-        print('====> Epoch: {} Average validation loss: {:.4f}'.format(\
-            epoch+1, validation_loss))
-        v_loss.append(validation_loss)
-    
-        if validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss
-            save_checkpoint(epoch, model, validation_loss, optimizer, args.model_dir, args.task + '_best.pt')
-        
-        # # learning rate annealing
-        # if (epoch+1)%10 == 0:
-        #     optimizer = decay_learning_rate(optimizer)
-        
-        # checkpoint model and training
-        filename = args.task + '_epoch_{}.pt'.format(epoch+1)
-        save_checkpoint(epoch, model, validation_loss, optimizer, args.model_dir, filename)
-        
-        print('wall time: {}s'.format(time.time()-start_time))
-        
-    f1 = plt.figure(1)
-    plt.plot(range(1, args.num_epochs+1), t_loss, color='blue', linestyle='solid')
-    plt.plot(range(1, args.num_epochs+1), v_loss, color='red', linestyle='solid')
-    f1.savefig(args.task +"_loss_curves", bbox_inches='tight')
-    
-    
-def synthesis_train(args, train_loader, validation_loader):
-    # infer padded text len and vocab len
-    padded_text_len, vocab_len = train_loader.dataset[0][2].size()
-    
-    # define model and optimizer
-    model = LSTMSynthesis(padded_text_len, vocab_len, args.cell_size, args.num_clusters, args.K)
-    if cuda:
-        model = model.cuda()
-    
-    optimizer = optim.Adam([{'params':model.parameters()},], lr=args.learning_rate)
-    
-    # initialize null hidden, memory states and cluster centers
-    h1_init = c1_init = torch.zeros((args.batch_size, args.cell_size))
-    h2_init = c2_init = torch.zeros((1, args.batch_size, args.cell_size))
-    kappa_old = torch.zeros(args.batch_size, args.K)
-    
-    if cuda:
-        h1_init, c1_init = h1_init.cuda(), c1_init.cuda()
-        h2_init, c2_init = h2_init.cuda(), c2_init.cuda()
-        kappa_old = kappa_old.cuda()
-        
-    h1_init, c1_init = Variable(h1_init, requires_grad=False), Variable(c1_init, requires_grad=False)
-    h2_init, c2_init = Variable(h2_init, requires_grad=False), Variable(c2_init, requires_grad=False)
-    kappa_old = Variable(kappa_old, requires_grad=False)
-    
-    t_loss = []
-    v_loss = []
-    best_validation_loss = 1E10
-    
-    # training
-    start_time = time.time()
-    for epoch in range(args.num_epochs):
-        train_loss =0
-        for batch_idx, (data, masks, onehots, text_lens) in enumerate(train_loader):
-            
-            # gather training batch
-            step_back = data.narrow(1,0,args.timesteps)
-            x = Variable(step_back, requires_grad=False)
-            onehots = Variable(onehots, requires_grad = False)
-            masks = Variable(masks, requires_grad=False)
-            masks = masks.narrow(1,0,args.timesteps)
-            text_lens = Variable(text_lens, requires_grad=False)
-            
-            # focus window weight on first text char
-            w_old = onehots.narrow(1,0,1).squeeze()
-            
-            optimizer.zero_grad()
-            
-            # feed forward
-            outputs = model(x,onehots, text_lens, w_old, kappa_old, (h1_init, c1_init), (h2_init, c2_init))
-            end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, w, kappa, prev, prev2, old_phi = outputs
-            data = data.narrow(1,1,args.timesteps)
-            y = Variable(data, requires_grad=False)
-            loss = -log_likelihood(end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, y, masks)/torch.sum(masks)
-            loss.backward()
-            train_loss += loss.data
-            optimizer.step()
-            if batch_idx % 10 == 0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                    epoch+1, batch_idx * len(data), len(train_loader.dataset),
-                    100. * batch_idx / len(train_loader),
-                    loss.data))
-    
-        print('====> Epoch: {} Average train loss: {:.4f}'.format(
-            epoch+1, train_loss/(len(train_loader.dataset)//args.batch_size)))
-        t_loss.append(train_loss/(len(train_loader.dataset)//args.batch_size))
-    
-        # validation
-        # prepare validation data
-        (validation_samples, masks, onehots, text_lens) = list(enumerate(validation_loader))[0][1]
-        step_back = validation_samples.narrow(1,0,args.timesteps)
-        masks = Variable(masks, requires_grad=False)
-        masks = masks.narrow(1,0,args.timesteps)
-        onehots = Variable(onehots, requires_grad=False)
-        text_lens = Variable(text_lens, requires_grad=False)
-        
-        w_old = onehots.narrow(1,0,1).squeeze()
-        x = Variable(step_back, requires_grad=False)
-        
-        validation_samples = validation_samples.narrow(1,1,args.timesteps)
-        y = Variable(validation_samples, requires_grad = False)
-    
-        outputs = model(x, onehots, text_lens, w_old, kappa_old, (h1_init, c1_init), (h2_init, c2_init))
-        end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, w, kappa, prev, prev2, old_phi = outputs
-        loss = -log_likelihood(end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, y, masks)/torch.sum(masks)
-        validation_loss = loss.data
-        print('====> Epoch: {} Average validation loss: {:.4f}'.format(\
-            epoch+1, validation_loss))
-        v_loss.append(validation_loss)
-    
-        
-        # # learning rate annealing
-        # if (epoch+1)%10 == 0:
-        #     optimizer = decay_learning_rate(optimizer)
-        
-        # checkpoint model and training
-        filename = args.task + '_epoch_{}.pt'.format(epoch+1)
-        save_checkpoint(epoch, model, validation_loss, optimizer, args.model_dir, filename)
-        
-        print('wall time: {}s'.format(time.time()-start_time))
-        
-    f1 = plt.figure(1)
-    plt.plot(range(1, args.num_epochs+1), t_loss, color='blue', linestyle='solid')
-    plt.plot(range(1, args.num_epochs+1), v_loss, color='red', linestyle='solid')
-    f1.savefig(args.task +"_loss_curves", bbox_inches='tight')
-    
-# training objective
-def log_likelihood(end, weights, mu_1, mu_2, log_sigma_1, log_sigma_2, rho, \
-                    y, masks):
-    # targets
-    y_0 = y.narrow(-1,0,1)
-    y_1 = y.narrow(-1,1,1)
-    y_2 = y.narrow(-1,2,1)
-    
-    # end of stroke prediction
-    end_loglik = (y_0*end + (1-y_0)*(1-end)).log().squeeze()
-    
-    # new stroke point prediction
-    const = 1E-20 # to prevent numerical error
-    pi_term = torch.Tensor([2*np.pi])
-    if cuda:
-        pi_term = pi_term.cuda()
-    pi_term = -Variable(pi_term, requires_grad = False).log()
-    
-    z = (y_1 - mu_1)**2/(log_sigma_1.exp()**2)\
-        + ((y_2 - mu_2)**2/(log_sigma_2.exp()**2)) \
-        - 2*rho*(y_1-mu_1)*(y_2-mu_2)/((log_sigma_1 + log_sigma_2).exp())
-    mog_lik1 =  pi_term -log_sigma_1 - log_sigma_2 - 0.5*((1-rho**2).log())
-    mog_lik2 = z/(2*(1-rho**2))
-    mog_loglik = ((weights.log() + (mog_lik1 - mog_lik2)).exp().sum(dim=-1)+const).log()
-    
-    return (end_loglik*masks).sum() + ((mog_loglik)*masks).sum()
+    train(dataset, NUM_STEPS, model, optimizer, alpha_set, PRINT_EVERY, SAVE_EVERY)
 
 if __name__ == '__main__':
     main()
